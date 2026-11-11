@@ -1,0 +1,83 @@
+# Builds a Sthapati release from the private source and publishes it here, where the app's updater reads it.
+# The source is checked out with a read-only deploy key and never published; the build's output is encrypted
+# (LOG_KEY) so the public log shows only whether it worked.
+#   gh workflow run build.yml -R mihir-maker/sthapati-releases -f tag=v0.9.0
+name: Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "A version tag of the private repo, e.g. v0.9.0"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            script: pwsh -NoProfile -File packaging/ci/windows.ps1
+          - os: macos-15
+            script: bash packaging/ci/macos.sh
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: mihir-maker/sthapati
+          ref: ${{ inputs.tag }}
+          ssh-key: ${{ secrets.SOURCE_KEY }}
+          persist-credentials: false
+          path: src
+
+      - name: Build (output encrypted)
+        shell: bash
+        working-directory: src
+        env:
+          STHAPATI_INVITE_URL: ${{ vars.INVITE_URL }}
+          LOG_KEY: ${{ secrets.LOG_KEY }}
+        run: |
+          if ${{ matrix.script }} > "$RUNNER_TEMP/build.log" 2>&1; then ok=1; else ok=0; fi
+          openssl enc -aes-256-cbc -pbkdf2 -salt -pass env:LOG_KEY -in "$RUNNER_TEMP/build.log" -out "$RUNNER_TEMP/build.log.enc"
+          rm -f "$RUNNER_TEMP/build.log"
+          if [ "$ok" != 1 ]; then echo "::error::Build failed. Get the log: packaging/build-log.sh <run id>"; exit 1; fi
+          ls dist/release
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: log-${{ matrix.os }}
+          path: ${{ runner.temp }}/build.log.enc
+          retention-days: 7
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.os }}
+          path: src/dist/release/*
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: dist
+
+      # gh release create gives each file the SHA-256 digest the updater checks; SHA256SUMS is its cross-check.
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          cd dist
+          sha256sum -- * > SHA256SUMS
+          ls -l
+          gh release create "$TAG" -R "$GITHUB_REPOSITORY" --title "Sthapati $TAG" --notes "Sthapati $TAG for Windows and macOS." -- *
