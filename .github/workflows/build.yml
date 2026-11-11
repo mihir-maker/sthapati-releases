@@ -1,6 +1,8 @@
-# Builds a Sthapati release from the private source and publishes it here, where the app's updater reads it.
-# The source is checked out with a read-only deploy key and never published; the build's output is encrypted
-# (LOG_KEY) so the public log shows only whether it worked.
+# Builds a Sthapati release from the private source, here because GitHub's build machines are free for a public repo, and
+# publishes it in the private repo mihir-maker/sthapati-bin (BIN_TOKEN: contents read and write on that repo only), which
+# sthapati.seaes.ai serves to firms with a code and to licensed apps. Nothing built is kept here: no release, no artifact but
+# the encrypted log. The source is checked out with a read-only deploy key; the build's output is encrypted (LOG_KEY) so the
+# public log shows only whether it worked.
 #   gh workflow run build.yml -R mihir-maker/sthapati-releases -f tag=v0.9.0
 name: Build
 
@@ -12,10 +14,26 @@ on:
         required: true
 
 permissions:
-  contents: write
+  contents: read
+
+env:
+  BIN: mihir-maker/sthapati-bin
+  TAG: ${{ inputs.tag }}
 
 jobs:
+  # A draft first, so the files go up beside each other and the release is seen (by the updater too) only once whole.
+  draft:
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          GH_TOKEN: ${{ secrets.BIN_TOKEN }}
+        run: |
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::$TAG isn't a version tag"; exit 1; }
+          gh release view "$TAG" -R "$BIN" >/dev/null 2>&1 \
+            || gh release create "$TAG" -R "$BIN" --draft --title "Sthapati $TAG" --notes "Sthapati $TAG for Windows and macOS."
+
   build:
+    needs: draft
     strategy:
       fail-fast: false
       matrix:
@@ -54,30 +72,24 @@ jobs:
           path: ${{ runner.temp }}/build.log.enc
           retention-days: 7
 
-      - uses: actions/upload-artifact@v4
-        with:
-          name: dist-${{ matrix.os }}
-          path: src/dist/release/*
-          if-no-files-found: error
-          retention-days: 1
+      - name: Upload to the private release
+        shell: bash
+        working-directory: src
+        env:
+          GH_TOKEN: ${{ secrets.BIN_TOKEN }}
+        run: gh release upload "$TAG" -R "$BIN" --clobber dist/release/* > /dev/null
 
   publish:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
-        with:
-          pattern: dist-*
-          merge-multiple: true
-          path: dist
-
-      # gh release create gives each file the SHA-256 digest the updater checks; SHA256SUMS is its cross-check.
-      - name: Publish
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TAG: ${{ inputs.tag }}
+      # The updater checks each file against the SHA-256 digest GitHub keeps for it; SHA256SUMS is its cross-check.
+      - env:
+          GH_TOKEN: ${{ secrets.BIN_TOKEN }}
         run: |
-          cd dist
+          mkdir dist && cd dist
+          gh release download "$TAG" -R "$BIN" --pattern 'sthapati-*' > /dev/null
           sha256sum -- * > SHA256SUMS
-          ls -l
-          gh release create "$TAG" -R "$GITHUB_REPOSITORY" --title "Sthapati $TAG" --notes "Sthapati $TAG for Windows and macOS." -- *
+          gh release upload "$TAG" -R "$BIN" --clobber SHA256SUMS > /dev/null
+          gh release edit "$TAG" -R "$BIN" --draft=false --latest > /dev/null
+          echo "published $(ls | wc -l) files"
